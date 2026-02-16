@@ -25,7 +25,7 @@ A generic, config-driven Python ETL pipeline that:
 
 1. **Detects** changes in Supabase via PostgreSQL LISTEN/NOTIFY (with polling fallback)
 2. **Accumulates** changes into priority-ordered micro-batches
-3. **Loads** batches into NetSuite via SOAP `upsertList` (up to 200 records per call)
+3. **Loads** batches into NetSuite via pluggable backend (REST batch or SOAP `upsertList`)
 4. **Tracks** sync state and failed records for reliability
 
 ### Architecture
@@ -43,8 +43,10 @@ Priority Accumulator (in-memory, per record type)
     │  Flush every 5s OR every 200 records (whichever first)
     │
     ▼
-NetSuite SOAP upsertList
-    │  Up to 200 records/call, TBA auth, concurrency-limited
+NetSuite Loader (pluggable backend)
+    │  REST batch (2026.1+) — primary
+    │  SOAP upsertList — fallback until 2028.2
+    │  OAuth 2.0 (REST) or TBA (SOAP), concurrency-limited
     │
     ▼
 State Store (sync watermarks, dead-letter queue)
@@ -54,12 +56,31 @@ State Store (sync watermarks, dead-letter queue)
 
 | Decision                              | Rationale                                               |
 |---------------------------------------|---------------------------------------------------------|
-| SOAP `upsertList` over RESTlets       | ~200x fewer API calls (200 records/call vs 1)           |
+| REST batch as primary backend         | Forward-compatible; SOAP is deprecated (EOL 2028.2)     |
+| SOAP `upsertList` as fallback         | Proven, mature; provides coverage until REST batch limits are fully documented |
+| Pluggable loader interface            | Swap backends without changing detection, batching, or mapping logic |
 | External ID-based upsert              | Idempotent — safe to retry without deduplication        |
-| Token-Based Auth (TBA) over OAuth 2.0 | No token refresh storms; one auth setup                 |
+| OAuth 2.0 (REST) / TBA (SOAP)        | Each backend uses its native auth method                |
 | LISTEN/NOTIFY + polling fallback      | Near-real-time with reliability guarantee               |
 | Priority-ordered flushing             | Master data loads before transactions that reference it |
 | 200-record batches (not 1,000)        | Smaller blast radius; avoids timeout risk               |
+
+### SOAP Deprecation Timeline
+
+Oracle is retiring the NetSuite SOAP API. The pipeline is designed to
+handle this transition:
+
+| Milestone | Release | Date (approx.) |
+|-----------|---------|----------------|
+| REST batch operations available | 2026.1 | Now (rolling out) |
+| Last SOAP endpoint released | 2025.2 | 2025 H2 |
+| New SOAP integrations blocked | 2027.1 | Early 2027 |
+| All SOAP endpoints disabled | **2028.2** | **Mid-late 2028** |
+
+**Migration path:** Start with REST batch as the primary backend. SOAP
+`upsertList` is available as a fallback for any record types or edge cases
+where REST batch support is incomplete. The pluggable loader interface means
+switching from SOAP to REST requires no changes outside the `netsuite/` module.
 
 ## 4. Requirements
 
@@ -80,8 +101,15 @@ records (invoices, sales orders) that reference them. Priority is declared per
 record type in the mapping configuration.
 
 **FR-4: Idempotent Upserts**
-All writes to NetSuite must use `upsertList` with deterministic external IDs
-derived from Supabase primary keys. Re-processing the same record must be safe.
+All writes to NetSuite must use batch upsert operations with deterministic
+external IDs derived from Supabase primary keys. Re-processing the same record
+must be safe. Both REST batch upsert and SOAP `upsertList` support external
+ID-based idempotency.
+
+**FR-8: Pluggable NetSuite Backend**
+The loader must support swappable backends (REST batch and SOAP) behind a
+common interface. The detection, batching, mapping, and state layers must be
+backend-agnostic. Configuration selects the active backend.
 
 **FR-5: Error Handling**
 - Partial batch failures must retry only the failed records (up to 3 attempts).
@@ -102,8 +130,8 @@ must resume from the last confirmed watermark with no data loss.
 
 **NFR-1: Rate Limit Compliance**
 The pipeline must never exceed NetSuite's concurrency limit (configurable,
-default 5 concurrent SOAP calls). Must handle `ExceededRequestLimitFault`
-gracefully with exponential backoff.
+default 5 concurrent calls). Must handle rate limit errors gracefully with
+exponential backoff — `ExceededRequestLimitFault` (SOAP) or HTTP 429 (REST).
 
 **NFR-2: Observability**
 Structured JSON logging with per-batch metrics: records sent, records failed,
@@ -122,8 +150,9 @@ must run against a local Postgres (via Docker) and optionally a NetSuite sandbox
 
 | Component         | Technology                       | Purpose                                                          |
 |-------------------|----------------------------------|------------------------------------------------------------------|
-| Language          | Python 3.11+                     | Best ecosystem for NetSuite SOAP                                 |
-| SOAP Client       | `zeep`                           | Mature Python SOAP library; call `upsertList` via SuiteTalk WSDL |
+| Language          | Python 3.11+                     | Strong ecosystem for both REST and SOAP NetSuite integration     |
+| HTTP Client       | `httpx`                          | Async HTTP client for REST batch API (primary backend)           |
+| SOAP Client       | `zeep`                           | SOAP `upsertList` via SuiteTalk WSDL (fallback backend)         |
 | Postgres Client   | `asyncpg`                        | Async LISTEN/NOTIFY + queries                                    |
 | Config Validation | `pydantic` / `pydantic-settings` | Type-safe settings from env vars + YAML                          |
 | Mapping Config    | `pyyaml`                         | Declarative field mappings                                       |
@@ -166,8 +195,8 @@ Within each flush cycle, records are sent in priority order:
 3. **Priority 3** — Transactions: Invoices, Sales Orders, Journal Entries
 
 Each priority tier is flushed sequentially. Within a tier, batches of up to
-200 records are sent via `upsertList`. Calls within the same tier may run
-concurrently up to the concurrency limit.
+200 records are sent via the active backend (REST batch or SOAP `upsertList`).
+Calls within the same tier may run concurrently up to the concurrency limit.
 
 ### 6.4 External ID Convention
 
@@ -189,12 +218,24 @@ supabase:
 
 netsuite:
   account: "${NETSUITE_ACCOUNT}"
-  consumer_key: "${NETSUITE_CONSUMER_KEY}"
-  consumer_secret: "${NETSUITE_CONSUMER_SECRET}"
-  token_key: "${NETSUITE_TOKEN_KEY}"
-  token_secret: "${NETSUITE_TOKEN_SECRET}"
+  backend: "rest"                              # "rest" (primary) or "soap" (fallback)
   max_concurrency: 5
-  soap_timeout: 120
+  request_timeout: 120
+
+  # REST backend (2026.1+ batch operations, OAuth 2.0)
+  rest:
+    base_url: "https://${NETSUITE_ACCOUNT}.suitetalk.api.netsuite.com/services/rest"
+    client_id: "${NETSUITE_CLIENT_ID}"
+    client_secret: "${NETSUITE_CLIENT_SECRET}"
+    token_url: "https://${NETSUITE_ACCOUNT}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token"
+
+  # SOAP backend (fallback, supported through 2028.2)
+  soap:
+    wsdl_url: "https://${NETSUITE_ACCOUNT}.suitetalk.api.netsuite.com/wsdl/v2025_2_0/netsuite.wsdl"
+    consumer_key: "${NETSUITE_CONSUMER_KEY}"
+    consumer_secret: "${NETSUITE_CONSUMER_SECRET}"
+    token_key: "${NETSUITE_TOKEN_KEY}"
+    token_secret: "${NETSUITE_TOKEN_SECRET}"
 
 pipeline:
   flush_interval_seconds: 5
@@ -267,14 +308,14 @@ record_types:
 
 ## 8. Error Handling
 
-| Failure Type                | Action                                                    |
-|-----------------------------|-----------------------------------------------------------|
-| `ExceededRequestLimitFault` | Exponential backoff (2s, 4s, 8s, 16s, 32s), max 5 retries |
-| Network timeout             | Retry once (upsert is idempotent via external ID)         |
-| Per-record validation error | Do NOT retry; route to dead-letter queue                  |
-| `InvalidSessionFault`       | Re-authenticate, then retry                               |
-| Partial batch failure       | Retry only failed records (up to 3 times)                 |
-| Dead-letter records         | Reconciliation loop retries every 15 minutes              |
+| Failure Type                           | Action                                                    |
+|----------------------------------------|-----------------------------------------------------------|
+| Rate limit (HTTP 429 / `ExceededRequestLimitFault`) | Exponential backoff (2s, 4s, 8s, 16s, 32s), max 5 retries |
+| Network timeout                        | Retry once (upsert is idempotent via external ID)         |
+| Per-record validation error            | Do NOT retry; route to dead-letter queue                  |
+| Auth failure (401 / `InvalidSessionFault`) | Re-authenticate, then retry                           |
+| Partial batch failure                  | Retry only failed records (up to 3 times)                 |
+| Dead-letter records                    | Reconciliation loop retries every 15 minutes              |
 
 ### Dead-Letter Schema
 
@@ -343,10 +384,11 @@ netsuite_etl/
 │   │   ├── accumulator.py
 │   │   └── flush_manager.py
 │   ├── netsuite/
-│   │   ├── auth.py
-│   │   ├── client.py
-│   │   ├── record_builder.py
-│   │   └── response_parser.py
+│   │   ├── base.py                # Abstract loader interface
+│   │   ├── rest_client.py         # REST batch backend (2026.1+, OAuth 2.0)
+│   │   ├── soap_client.py         # SOAP upsertList backend (TBA auth)
+│   │   ├── record_builder.py      # Dict → API payloads (REST JSON / SOAP XML)
+│   │   └── response_parser.py     # Parse batch responses from either backend
 │   ├── mapping/
 │   │   ├── engine.py
 │   │   ├── external_id.py
@@ -364,7 +406,8 @@ netsuite_etl/
 │   │   ├── test_response_parser.py
 │   │   ├── test_accumulator.py
 │   │   ├── test_flush_manager.py
-│   │   ├── test_auth.py
+│   │   ├── test_rest_client.py
+│   │   ├── test_soap_client.py
 │   │   └── test_state_manager.py
 │   ├── integration/
 │   │   ├── test_netsuite_client.py
@@ -402,27 +445,28 @@ netsuite-etl backfill --tables customers,items --since 2024-01-01
 5. `errors.py` — exception types
 
 ### Phase 2: NetSuite Integration
-6. `netsuite/auth.py` — TBA TokenPassport
-7. `netsuite/client.py` — zeep SOAP wrapper
-8. `netsuite/record_builder.py` — dict to zeep objects
-9. `netsuite/response_parser.py` — parse responses
+6. `netsuite/base.py` — abstract loader interface
+7. `netsuite/rest_client.py` — REST batch backend (OAuth 2.0, async)
+8. `netsuite/soap_client.py` — SOAP `upsertList` backend (TBA auth)
+9. `netsuite/record_builder.py` — dict to API payloads
+10. `netsuite/response_parser.py` — parse batch responses
 
 ### Phase 3: Change Detection
-10. `detection/listener.py` — LISTEN/NOTIFY
-11. `detection/poller.py` — watermark polling
-12. `detection/detector.py` — orchestrator
+11. `detection/listener.py` — LISTEN/NOTIFY
+12. `detection/poller.py` — watermark polling
+13. `detection/detector.py` — orchestrator
 
 ### Phase 4: Batching & State
-13. `batching/accumulator.py` — priority queue
-14. `batching/flush_manager.py` — flush + retry
-15. `state/` — backend, manager, dead-letter
+14. `batching/accumulator.py` — priority queue
+15. `batching/flush_manager.py` — flush + retry
+16. `state/` — backend, manager, dead-letter
 
 ### Phase 5: Assembly
-16. `pipeline.py` — async orchestrator
-17. `cli.py` + `__main__.py`
-18. SQL migrations
-19. Integration tests
-20. Docker / deployment config
+17. `pipeline.py` — async orchestrator
+18. `cli.py` + `__main__.py`
+19. SQL migrations
+20. Integration tests (REST batch + SOAP fallback)
+21. Docker / deployment config
 
 ## 13. Verification & Acceptance Criteria
 
